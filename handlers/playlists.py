@@ -5,9 +5,16 @@ from aiogram.fsm.context import FSMContext
 import asyncio
 import os
 from services.database import (
-    create_user, get_user_playlists, create_playlist, get_playlist_tracks,
-    delete_playlist, get_playlist_info, add_track_to_playlist,
-    remove_track_from_playlist, track_exists_in_playlist, rename_playlist
+    create_user,
+    get_user_playlists,
+    create_playlist,
+    get_playlist_tracks,
+    delete_playlist,
+    get_playlist_info,
+    add_track_to_playlist,
+    remove_track_from_playlist,
+    track_exists_in_playlist,
+    update_track_file_id
 )
 from handlers.start import get_main_menu_kb, get_back_kb
 
@@ -74,8 +81,13 @@ async def process_create_playlist(message: Message, state: FSMContext):
         track = track_data.get('last_track')
         if track:
             await add_track_to_playlist(
-                playlist_id=playlist_id, user_id=user_id, deezer_id=pending_deezer_id,
-                title=track['title'], artist=track['artist'], album=track.get('album', ''), cover_url=track.get('cover_url', '')
+                playlist_id=playlist_id,
+                user_id=user_id,
+                deezer_id=pending_deezer_id,
+                title=track['title'],
+                artist=track['artist'],
+                album=track.get('album', ''),
+                cover_url=track.get('cover_url', '')
             )
             await message.answer(f"✅ Плейлист **\"{playlist_name}\"** создан!\nТрек **{track['title']}** добавлен в него.", reply_markup=get_main_menu_kb(), parse_mode="Markdown")
             return
@@ -109,6 +121,7 @@ async def open_playlist(callback: CallbackQuery, state: FSMContext):
         keyboard_buttons.append([InlineKeyboardButton(text="▶️ Воспроизвести", callback_data=f"playlist_play_{playlist_id}_0")])
         if total_pages > 1:
             keyboard_buttons.append([InlineKeyboardButton(text="📄 Все треки", callback_data=f"playlist_page_{playlist_id}_0")])
+            
     keyboard_buttons.append([
         InlineKeyboardButton(text="✏️ Переименовать", callback_data=f"playlist_rename_{playlist_id}"),
         InlineKeyboardButton(text="🗑 Удалить", callback_data=f"playlist_delete_{playlist_id}")
@@ -175,25 +188,13 @@ async def process_rename_playlist(message: Message, state: FSMContext):
         await state.clear()
         return
         
+    from services.database import rename_playlist
     renamed = await rename_playlist(playlist_id, message.from_user.id, new_name)
     await state.clear()
     if renamed:
         await message.answer(f"✅ Плейлист переименован в **\"{new_name}\"**!", parse_mode="Markdown")
     else:
         await message.answer("❌ Ошибка при переименовании.")
-
-@router.callback_query(F.data.startswith("playlist_remove_track_"))
-async def remove_track_handler(callback: CallbackQuery, state: FSMContext):
-    parts = callback.data.split("_")
-    track_id = int(parts[3])
-    playlist_id = int(parts[4])
-    user_id = callback.from_user.id
-    removed = await remove_track_from_playlist(track_id, playlist_id, user_id)
-    if removed:
-        await callback.answer("✅ Трек удалён из плейлиста!")
-        await open_playlist(callback, state)
-    else:
-        await callback.answer("❌ Ошибка при удалении трека.", show_alert=True)
 
 @router.callback_query(F.data.startswith("playlist_play_"))
 async def start_playing_playlist(callback: CallbackQuery, state: FSMContext):
@@ -217,53 +218,146 @@ async def start_playing_playlist(callback: CallbackQuery, state: FSMContext):
     await send_current_track(callback, state, tracks, track_index)
 
 async def send_current_track(callback: CallbackQuery, state: FSMContext, tracks: list, track_index: int):
-    track = tracks[track_index]
-    from services.youtube_service import download_track, embed_cover_and_tags
+    await callback.answer()
     
-    result = await asyncio.to_thread(download_track, track['title'], track['artist'], track.get('cover_url'))
-    if not result:
-        await callback.message.answer(f"❌ Не удалось скачать трек: {track['artist']} — {track['title']}\nПропускаю...", parse_mode="Markdown")
-        await callback.answer()
-        return
-        
-    await asyncio.to_thread(embed_cover_and_tags, result['file_path'], result['title'], result['artist'], result.get('cover_url'), track.get('album', ''))
-    audio_file = FSInputFile(result['file_path'])
+    track = tracks[track_index]
     playlist_data = await state.get_data()
     playlist_id = playlist_data.get('current_playlist_id')
+    old_message_id = playlist_data.get('player_message_id')
+    
+    if old_message_id:
+        try:
+            await callback.message.bot.edit_message_caption(
+                chat_id=callback.message.chat.id,
+                message_id=old_message_id,
+                caption="⏳ Загрузка...",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⏳", callback_data="noop")]])
+            )
+        except Exception:
+            pass
+    
+    file_id = track.get('file_id')
+    
+    if file_id:
+        audio_file = file_id
+    else:
+        from services.youtube_service import download_track, embed_cover_and_tags
+        
+        await callback.message.bot.send_chat_action(
+            chat_id=callback.message.chat.id, 
+            action="upload_voice"
+        )
+        
+        result = await asyncio.to_thread(
+            download_track,
+            track['title'],
+            track['artist'],
+            track.get('cover_url')
+        )
+        
+        if not result:
+            await callback.message.answer(
+                f"❌ Не удалось скачать трек: {track['artist']} — {track['title']}\nПропускаю...",
+                parse_mode="Markdown"
+            )
+            return
+            
+        await asyncio.to_thread(
+            embed_cover_and_tags,
+            result['file_path'],
+            result['title'],
+            result['artist'],
+            result.get('cover_url'),
+            track.get('album', '')
+        )
+        
+        audio_file = FSInputFile(result['file_path'])
     
     keyboard_buttons = []
     nav_buttons = []
     if track_index > 0:
-        nav_buttons.append(InlineKeyboardButton(text="⏮ Пред.", callback_data=f"playlist_play_{playlist_id}_{track_index - 1}"))
-    nav_buttons.append(InlineKeyboardButton(text=f"🎵 {track_index + 1}/{len(tracks)}", callback_data="noop"))
+        nav_buttons.append(InlineKeyboardButton(
+            text="⏮ Пред.",
+            callback_data=f"playlist_play_{playlist_id}_{track_index - 1}"
+        ))
+    nav_buttons.append(InlineKeyboardButton(
+        text=f"🎵 {track_index + 1}/{len(tracks)}",
+        callback_data="noop"
+    ))
     if track_index < len(tracks) - 1:
-        nav_buttons.append(InlineKeyboardButton(text="⏭ След.", callback_data=f"playlist_play_{playlist_id}_{track_index + 1}"))
+        nav_buttons.append(InlineKeyboardButton(
+            text="⏭ След.",
+            callback_data=f"playlist_play_{playlist_id}_{track_index + 1}"
+        ))
         
     if nav_buttons:
         keyboard_buttons.append(nav_buttons)
-    keyboard_buttons.append([InlineKeyboardButton(text="⏹ Стоп", callback_data="stop_playlist")])
+    keyboard_buttons.append([
+        InlineKeyboardButton(text="⏹ Стоп", callback_data="stop_playlist")
+    ])
     keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
     
-    await callback.message.answer_audio(
+    msg = await callback.message.answer_audio(
         audio=audio_file,
-        title=result['title'],
-        performer=result['artist'],
-        caption=f"🎵 **{result['title']}**\n👤 *{result['artist']}*",
+        title=track['title'],
+        performer=track['artist'],
+        caption=f"🎵 **{track['title']}**\n👤 *{track['artist']}*",
         parse_mode="Markdown",
-        reply_markup=keyboard
+        reply_markup=keyboard,
+        thumb=track.get('cover_url')
     )
-    await callback.answer()
+    
+    await state.update_data(player_message_id=msg.message_id)
+    
+    if not file_id and msg.audio and msg.audio.file_id:
+        await update_track_file_id(track['id'], msg.audio.file_id)
+    
+    if old_message_id:
+        try:
+            await callback.message.bot.delete_message(
+                chat_id=callback.message.chat.id,
+                message_id=old_message_id
+            )
+        except Exception:
+            pass
 
 @router.callback_query(F.data == "stop_playlist")
 async def stop_playlist(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
     await callback.answer("⏹ Воспроизведение остановлено")
+    
     playlist_data = await state.get_data()
-    playlist_id = playlist_data.get('current_playlist_id')
-    if playlist_id:
-        await open_playlist(callback, state)
+    old_message_id = playlist_data.get('player_message_id')
+    await state.clear()
+    
+    if old_message_id:
+        try:
+            await callback.message.bot.delete_message(
+                chat_id=callback.message.chat.id,
+                message_id=old_message_id
+            )
+        except Exception:
+            pass
+            
+    user_id = callback.from_user.id
+    await create_user(user_id, callback.from_user.full_name or "Пользователь")
+    playlists = await get_user_playlists(user_id)
+    
+    if not playlists:
+        text = "🎛 **Твои плейлисты**\nУ тебя пока нет плейлистов.\nНажми кнопку ниже, чтобы создать первый!"
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Создать плейлист", callback_data="create_new_playlist")],
+            [InlineKeyboardButton(text="🔙 Назад в меню", callback_data="back_to_main")]
+        ])
     else:
-        await show_playlists_menu(callback, state)
+        text = "🎛 **Твои плейлисты**\n"
+        kb = []
+        for pl in playlists[:10]:
+            kb.append([InlineKeyboardButton(text=f"📼 {pl['name']} ({pl['track_count']})", callback_data=f"playlist_open_{pl['id']}")])
+        kb.append([InlineKeyboardButton(text="➕ Создать плейлист", callback_data="create_new_playlist")])
+        kb.append([InlineKeyboardButton(text="🔙 Назад в меню", callback_data="back_to_main")])
+        keyboard = InlineKeyboardMarkup(inline_keyboard=kb)
+
+    await callback.message.answer(text, reply_markup=keyboard, parse_mode="Markdown")
 
 @router.callback_query(F.data == "noop")
 async def noop_handler(callback: CallbackQuery):
@@ -271,7 +365,20 @@ async def noop_handler(callback: CallbackQuery):
 
 @router.callback_query(F.data == "back_to_main", F.state.in_([PlaylistStates.waiting_for_playlist_name, PlaylistStates.waiting_for_rename, PlaylistStates.playing_playlist]))
 async def back_to_main_from_playlist(callback: CallbackQuery, state: FSMContext):
+    playlist_data = await state.get_data()
+    old_message_id = playlist_data.get('player_message_id')
+    
     await state.clear()
+    
+    if old_message_id:
+        try:
+            await callback.message.bot.delete_message(
+                chat_id=callback.message.chat.id,
+                message_id=old_message_id
+            )
+        except Exception:
+            pass
+            
     text = "🌑 **Добро пожаловать в LIMINAL**.\nМузыка на пороге состояний.\nВыбери действие ниже 👇"
     await callback.message.edit_text(text, reply_markup=get_main_menu_kb(), parse_mode="Markdown")
     await callback.answer()
@@ -294,9 +401,15 @@ async def add_track_to_playlist_handler(callback: CallbackQuery, state: FSMConte
         return
         
     added = await add_track_to_playlist(
-        playlist_id=playlist_id, user_id=user_id, deezer_id=deezer_id,
-        title=track['title'], artist=track['artist'], album=track.get('album', ''), cover_url=track.get('cover_url', '')
+        playlist_id=playlist_id,
+        user_id=user_id,
+        deezer_id=deezer_id,
+        title=track['title'],
+        artist=track['artist'],
+        album=track.get('album', ''),
+        cover_url=track.get('cover_url', '')
     )
+    
     playlist_info = await get_playlist_info(playlist_id, user_id)
     playlist_name = playlist_info['name'] if playlist_info else "Неизвестно"
     
@@ -316,7 +429,7 @@ async def add_track_to_playlist_handler(callback: CallbackQuery, state: FSMConte
             ],
             [InlineKeyboardButton(text="🔙 Назад в меню", callback_data="back_to_main")]
         ])
-        await callback.message.answer(text, reply_markup=keyboard, parse_mode="Markdown")
+        await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
     else:
         await callback.answer("❌ Ошибка при добавлении.", show_alert=True)
 

@@ -12,7 +12,7 @@ from mutagen.id3 import ID3, TIT2, TPE1, TALB, APIC
 import requests
 from services.playlist_service import extract_playlist_info, download_playlist_tracks, create_zip_archive
 from services.deezer_service import search_track_deezer
-from handlers.start import get_main_menu_kb
+from handlers.start import get_main_menu_kb, get_back_kb
 
 router = Router()
 
